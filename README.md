@@ -1,4 +1,4 @@
-# Module Auth (xác thực & phân quyền) — CashCash
+[# Module Auth (xác thực & phân quyền) — CashCash
 
 > Tài liệu này đi theo **luồng hoạt động qua từng tầng**: mỗi user story được lần từ nút bấm trên giao diện, qua từng lớp backend, xuống tới hàm SQL trong database, kèm link tới đúng dòng code.
 > Cuối tài liệu là **bộ câu hỏi vấn đáp** (trace code, "vì sao", "nếu… thì sao", tấn công) và **checklist demo** cho buổi chấm điểm.
@@ -660,3 +660,4 @@ Script kiểm với DB thật: [check-auth.ts](../backend/scripts/check-auth.ts)
 | RPC | Hàm Postgres gọi từ backend, chạy trong một transaction |
 | `FOR UPDATE` | Khoá dòng, request khác phải chờ, chống race condition |
 | Rate limit | Giới hạn số request trong một khoảng thời gian |
+](https://www.tiktok.com/@nguyendocthancadoi/video/7697836901662821650?is_from_webapp=1&sender_device=pc&web_id=7693981593920865793)
