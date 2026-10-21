@@ -3,8 +3,118 @@
 > Tài liệu này đi theo **luồng hoạt động qua từng tầng**: mỗi user story được lần từ nút bấm trên giao diện, qua từng lớp backend, xuống tới hàm SQL trong database, kèm link tới đúng dòng code.
 > Cuối tài liệu là **hướng dẫn cách trình bày và trả lời** (công thức trả lời, bài giới thiệu 2 phút, cách trace trên VS Code, văn mẫu), **bộ câu hỏi vấn đáp** (trace code, "vì sao", "nếu… thì sao", tấn công) và **checklist demo** cho buổi chấm điểm.
 
+## 0. Hành trình của 1 request qua backend
+
+> Câu hỏi: *"Một request gửi tới backend thì đi qua những tầng nào, theo thứ tự nào, mỗi tầng làm gì và trả về đâu?"*
+
+### 0.1. Sơ đồ tổng quát
+
+```
+Client (fetch, cookie cc_access / cc_refresh, header X-CashCash-Request: 1)
+   │
+   ▼
+[A] server.ts ─ Node mở cổng PORT, mọi request vào app do createApp() tạo
+   │
+   ▼
+[B] app.ts ─ pipeline middleware chung (chạy cho MỌI request, đúng thứ tự khai báo)
+   │   1. helmet()                → gắn header bảo mật
+   │   2. cors()                  → chỉ cho origin trong CORS_ORIGIN, cho phép gửi cookie
+   │   3. express.json(100kb)     → parse body JSON vào req.body
+   │   4. requestLogger           → bấm giờ, log khi response xong
+   │   5. GET /health             → trả { ok: true } luôn (dừng tại đây)
+   │   6. chặn CSRF cho /api/v1   → method ghi dữ liệu thiếu header / sai Origin ⇒ 403
+   │
+   ├── /api/v1/auth/*  ─────────────────────► [C1] authRouter (KHÔNG cần đăng nhập)
+   │                                             rateLimit → authController
+   │
+   └── /api/v1/*  ──► [C2] currentUser ──────► [D] apiRouter (routes.ts)
+                       verify JWT, gắn           /accounts /categories /transactions
+                       req.userId, req.role      /summary /users /debts /receipts
+                       sai ⇒ 401                 /assistant /admin (requireRole ⇒ 403)
+                                                     │
+                                                     ▼
+                                    [E] Controller (presentation)
+                                        parseInput(Zod) ⇒ sai thì 400
+                                        lấy req.userId, gọi service
+                                                     │
+                                                     ▼
+                                    [F] Service (application)
+                                        nghiệp vụ, kiểm quyền sở hữu dữ liệu
+                                        gọi infrastructure (JWT, scrypt, Google, mail, Gemini…)
+                                                     │
+                                                     ▼
+                                    [G] Supabase client ─► Postgres
+                                        .from(...).select/insert/update  hoặc  .rpc('cashcash_*')
+                                                     │
+          ◄──────────── kết quả đi NGƯỢC lên: DB → service → controller ──┘
+                         controller: res.status(...).json(dto) / res.cookie(...) / 204
+   │
+   ▼
+[H] Nếu ở BẤT KỲ tầng nào có throw:
+       Express 5 tự bắt (kể cả trong async) → nhảy thẳng tới errorHandler
+       không khớp route nào → notFoundHandler (404) → errorHandler
+       errorHandler ⇒ JSON { error: { code, message, details } } + status tương ứng
+   │
+   ▼
+requestLogger in "METHOD URL STATUS xx ms" → response về lại Client
+   (frontend lib/http.ts: 2xx ⇒ trả data; 401 ⇒ tự gọi /auth/refresh rồi gửi lại; lỗi khác ⇒ ném ApiError cho UI)
+```
+
+### 0.2. Request đi qua những file middleware nào, mỗi file làm gì
+
+Request vào backend thì gặp [app.ts](../backend/src/app.ts) đầu tiên. File này giống trạm kiểm soát chung: middleware nào khai báo trước thì chạy trước. Ba dòng đầu, từ [dòng 17 tới 19](../backend/src/app.ts#L17-L19), dùng thư viện có sẵn nên không có file riêng. `helmet` gắn thêm các header bảo mật vào response, ví dụ cấm trang khác nhúng web mình vào iframe. `cors` quy định chỉ frontend của mình (các địa chỉ trong `CORS_ORIGIN`) mới được đọc kết quả, và cho phép gửi kèm cookie. `express.json` đọc body JSON, giới hạn 100kb, rồi đặt vào `req.body`. Nếu bị hỏi, chỉ vào ba dòng này và nói: *"Ba middleware này của thư viện. Em chỉ cấu hình: CORS thì giới hạn origin, JSON thì giới hạn kích thước body."*
+
+Tiếp theo request đi qua file riêng đầu tiên là [request-logger.ts](../backend/src/middlewares/request-logger.ts). Nó không chặn gì. Nó ghi lại thời điểm bắt đầu rồi gọi `next()` cho đi tiếp. Khi response gửi xong (sự kiện `finish`), nó in ra một dòng gồm method, URL, status code và số mili giây đã chạy. Middleware này đứng đầu chuỗi nhưng lại in log ở cuối, vì phải đợi có kết quả mới biết status.
+
+Quay lại [app.ts dòng 26 tới 34](../backend/src/app.ts#L26-L34) là đoạn chặn CSRF, viết thẳng trong app.ts. Mọi request làm thay đổi dữ liệu, tức không phải GET/HEAD/OPTIONS, đều phải có header `X-CashCash-Request: 1` do frontend tự gắn. Nếu có `Origin` thì Origin đó phải nằm trong danh sách cho phép. Thiếu một trong hai điều kiện là `throw` lỗi 403 ngay. Lý do: trang web lạ có thể lừa trình duyệt gửi request kèm cookie của người dùng, nhưng không gắn được header tuỳ ý.
+
+Tới [dòng 35 và 36](../backend/src/app.ts#L35-L36) thì đường đi tách làm hai. Chỉ vào hai dòng này và nói: *"Cái gì bắt đầu bằng `/auth` thì đi vào authRouter mà không cần đăng nhập. Còn lại đều phải qua `currentUser` trước."*
+
+Nhánh `/auth` đi vào [auth.routes.ts](../backend/src/features/auth/presentation/auth.routes.ts). Ở đây các route nhạy cảm như login, register, quên mật khẩu được gắn thêm middleware từ [rate-limit.ts](../backend/src/middlewares/rate-limit.ts). File này giữ một cái `Map` trong RAM, khoá là tên nhóm cộng địa chỉ IP, giá trị là số lần đã gọi và thời điểm hết hạn sau 15 phút. Mỗi request tăng bộ đếm lên một; vượt mức thì trả 429. Nó còn tự dọn các khoá đã hết hạn. Khi Map quá 10.000 khoá thì nó bỏ khoá cũ nhất thay vì khoá luôn cả hệ thống. Qua được rate limit thì vào controller của auth.
+
+Các nhánh còn lại đi qua [current-user.ts](../backend/src/middlewares/current-user.ts). Đây là middleware quan trọng nhất nên nói kỹ. Nó lấy access token từ cookie `cc_access`, việc đọc cookie nằm ở hàm `accessToken` trong [auth.cookie.ts](../backend/src/features/auth/presentation/auth.cookie.ts#L17-L20). Sau đó nó gọi `verifyAccessToken` trong [jwt.ts](../backend/src/features/auth/infrastructure/jwt.ts#L25-L38) để kiểm chữ ký, thuật toán, người phát hành, đối tượng nhận và hạn dùng. Token sai hay hết hạn thì trả 401. Token đúng thì nó gắn `req.userId` và `req.role` lấy từ token rồi cho đi tiếp. Có hai ý nên nói thêm. Thứ nhất, bước này không truy vấn database nên rất nhanh. Thứ hai, `userId` lấy từ token do server ký, không lấy từ body, nên người dùng không giả làm người khác được. Hai field này khai báo kiểu trong [express.d.ts](../backend/src/types/express.d.ts).
+
+Qua `currentUser`, request tới [routes.ts](../backend/src/routes.ts). File này chỉ là bảng chỉ đường: `/accounts` đi vào router tài khoản, `/transactions` đi vào router giao dịch, và tương tự cho các route khác. Riêng `/admin` đi vào [admin.routes.ts](../backend/src/features/admin/presentation/admin.routes.ts#L9). Dòng đầu file này gắn `requireRole('ADMIN')` từ [require-role.ts](../backend/src/middlewares/require-role.ts). Middleware này chỉ so `req.role` mà `currentUser` vừa gắn: không phải ADMIN thì trả 403. Nó bắt buộc phải chạy sau `currentUser`, vì chưa có role thì không có gì để so.
+
+Tới đây request đã vào controller rồi xuống service, không còn là middleware nữa. Middleware cuối cùng là [error-handler.ts](../backend/src/middlewares/error-handler.ts), gắn ở [dòng 38 và 39 của app.ts](../backend/src/app.ts#L38-L39). Trong file có hai hàm. `notFoundHandler` chạy khi không route nào khớp, nó throw lỗi 404. `errorHandler` là nơi gom mọi lỗi: tầng nào `throw` thì Express 5 cũng tự chuyển lỗi về đây, kể cả trong hàm async. Nếu lỗi là `HttpError` (class trong [http-error.ts](../backend/src/lib/http-error.ts)) thì trả đúng status và JSON dạng `{ error: { code, message, details } }`. Nếu do body JSON hỏng thì trả 400. Còn lỗi lạ thì chỉ log ở server, trả về 500 với câu chung chung để không lộ thông tin bên trong. Nhờ vậy, ở controller hay service chỉ việc `throw`, không cần try/catch khắp nơi.
+
+**Tóm lại một câu:** *"Request vào app.ts, qua helmet, CORS và parse JSON, qua request-logger để đo thời gian, qua bước chặn CSRF. Sau đó `/auth` đi vào auth.routes và có rate-limit; các route khác phải qua current-user để xác thực JWT, rồi routes.ts chia theo feature, admin thì qua thêm require-role. Lỗi ở bất kỳ đâu đều throw về error-handler để trả JSON thống nhất."*
+
+### 0.3. Chiều trả về
+
+```
+Postgres ──rows / kết quả RPC──► Service ──DTO (đã bỏ field nhạy cảm, vd password)──► Controller
+Controller ──res.status(200|201|204).json(dto) (+ Set-Cookie nếu là auth)──► requestLogger log ──► Client
+Lỗi ở bất kỳ đâu ──throw HttpError/Error──► errorHandler ──JSON { error }──► requestLogger log ──► Client
+```
+
+Frontend nhận ở [http.ts](../frontend/src/lib/http.ts): 2xx thì trả data cho component; **401** thì tự gọi `POST /auth/refresh` một lần rồi gửi lại request gốc (trừ các route trong `NO_REFRESH`); lỗi khác thì ném `ApiError` để UI hiển thị `message`.
+
+### 0.4. Hai ví dụ cụ thể
+
+**Ví dụ 1 — `GET /api/v1/categories` (route cần đăng nhập):**
+
+1. helmet → cors → json → logger → (GET nên **bỏ qua** chặn CSRF)
+2. Không phải `/auth` → [currentUser](../backend/src/middlewares/current-user.ts#L7-L13) verify cookie `cc_access` → gắn `req.userId`
+3. [routes.ts:16](../backend/src/routes.ts#L16) `/categories` → [category.routes.ts](../backend/src/features/categories/presentation/category.routes.ts#L6) `GET /` → [categoryController.list](../backend/src/features/categories/presentation/category.controller.ts#L5-L7)
+4. [categoryService.list(userId)](../backend/src/features/categories/application/category.service.ts#L12-L23) → Supabase `select … from categories where userId = ? and isArchived = false`
+5. Trả về: `200` + mảng `CategoryDto[]`. Token hết hạn ở bước 2 → `401` → frontend tự refresh rồi gọi lại.
+
+**Ví dụ 2 — `POST /api/v1/auth/login` (route công khai):**
+
+1. helmet → cors → json → logger → chặn CSRF (POST nên **phải** có `X-CashCash-Request: 1`)
+2. `/api/v1/auth` → [authRouter](../backend/src/features/auth/presentation/auth.routes.ts#L6) → `rateLimit('credentials', 20)` (**không** qua `currentUser`)
+3. [authController.login](../backend/src/features/auth/presentation/auth.controller.ts#L46-L51) → `parseInput(loginSchema)`
+4. [authService.login](../backend/src/features/auth/application/auth.service.ts#L45) → tìm user, `verifyPassword` (scrypt) → RPC `cashcash_session_create` lưu SHA-256 của refresh token → ký JWT access token
+5. Quay lên controller: thu hồi refresh token cũ (nếu có), `setAuthCookies` → `Set-Cookie: cc_access, cc_refresh` (HttpOnly) → `200` + thông tin user (không có mật khẩu). Sai mật khẩu → `401`, quá 20 lần → `429`.
+
+**Câu chốt:** *"Request vào `app.ts` đi qua các middleware chung (bảo mật header, CORS, parse JSON, log, chặn CSRF), rồi tách 2 nhánh: `/auth` thì công khai có rate limit, còn lại phải qua `currentUser` xác thực JWT. Sau đó router đưa tới controller để validate bằng Zod, controller gọi service làm nghiệp vụ, service gọi Supabase/RPC xuống Postgres. Kết quả đi ngược lên controller để trả JSON và cookie; còn lỗi ở bất kỳ tầng nào đều được `throw` và gom về một chỗ là `errorHandler` để trả JSON lỗi thống nhất."*
+
+---
+
 ## Mục lục
 
+0. [Hành trình của 1 request qua backend](#0-hành-trình-của-1-request-qua-backend)
 1. [Các tầng của hệ thống](#1-các-tầng-của-hệ-thống)
 2. [User stories](#2-user-stories)
 3. [Trace từng user story qua các tầng](#3-trace-từng-user-story-qua-các-tầng)
