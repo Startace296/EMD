@@ -158,8 +158,8 @@ Frontend nhận ở [http.ts](../frontend/src/lib/http.ts): 2xx thì trả data 
 | ⑥ | Presentation | [auth.controller.ts](../backend/src/features/auth/presentation/auth.controller.ts), [auth.cookie.ts](../backend/src/features/auth/presentation/auth.cookie.ts) | Parse input bằng Zod, gọi service, đặt/xoá cookie, chọn status code | Không truy cập DB trực tiếp |
 | ⑦ | Application | [auth.service.ts](../backend/src/features/auth/application/auth.service.ts), [password-reset.service.ts](../backend/src/features/auth/application/password-reset.service.ts), [user.service.ts](../backend/src/features/users/application/user.service.ts) | Nghiệp vụ: đăng ký, đăng nhập, xoay vòng token, reset mật khẩu | Không biết gì về cookie/HTTP |
 | ⑧ | Infrastructure | [jwt.ts](../backend/src/features/auth/infrastructure/jwt.ts), [password.ts](../backend/src/features/auth/infrastructure/password.ts), [refresh-token.ts](../backend/src/features/auth/infrastructure/refresh-token.ts), [google.ts](../backend/src/features/auth/infrastructure/google.ts) | Ký/kiểm JWT, hash scrypt, sinh token ngẫu nhiên, nói chuyện với Google | Không biết nghiệp vụ |
-| ⑨ | RPC | [refresh_tokens migration](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql), [oauth_accounts migration](../backend/db/migrations/20261017140000_oauth_accounts/migration.sql), [user_role migration](../backend/db/migrations/20261017120000_user_role/migration.sql) | Các thao tác nhiều bước chạy **trong một transaction**, có khoá dòng (`FOR UPDATE`) | — |
-| ⑩ | Bảng | `users`, `refresh_tokens`, `oauth_accounts`, `password_resets` | Lưu dữ liệu; trigger bảo vệ cột `role` | Không lưu token thô, chỉ lưu SHA-256 |
+| ⑨ | RPC | [refresh_tokens migration](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql), [oauth_accounts migration](../backend/db/migrations/20261017140000_oauth_accounts/migration.sql), [user_role migration](../backend/db/migrations/20261017120000_user_role/migration.sql), [admin_users migration](../backend/db/migrations/20261020120000_admin_users/migration.sql) | Các thao tác nhiều bước chạy **trong một transaction**, có khoá dòng (`FOR UPDATE`) | — |
+| ⑩ | Bảng | `users`, `refresh_tokens`, `oauth_accounts`, `password_resets` | Lưu dữ liệu; trigger bảo vệ cột `role`; trigger chặn cấp phiên cho tài khoản bị khoá (`lockedAt`) | Không lưu token thô, chỉ lưu SHA-256 |
 
 **Câu chốt khi được hỏi "kiến trúc module của em thế nào?":**
 > Backend chia theo feature, trong mỗi feature có 3 lớp: *presentation* (route + controller + cookie), *application* (service nghiệp vụ), *infrastructure* (JWT, hash, Google, mail). Controller chỉ lo HTTP; service không biết cookie; thao tác DB nhiều bước được đẩy xuống hàm RPC trong Postgres để chạy nguyên tử. Schema Zod nằm ở `packages/shared` nên frontend và backend validate giống hệt nhau.
@@ -193,7 +193,8 @@ Request
 | **US-06** | Là người dùng quên mật khẩu, tôi muốn **đặt lại mật khẩu bằng OTP qua email**. | OTP 6 số, hết hạn sau 10 phút, tối đa 5 lần thử; không tiết lộ email có tồn tại hay không; đặt lại xong thì mọi phiên cũ bị đăng xuất. |
 | **US-07** | Là người dùng đang đăng nhập, tôi muốn **đổi mật khẩu** (hoặc đặt mật khẩu lần đầu nếu tạo tài khoản bằng Google). | Phải nhập đúng mật khẩu hiện tại (trừ tài khoản Google chưa có mật khẩu); các thiết bị khác bị đăng xuất, thiết bị hiện tại vẫn đăng nhập. |
 | **US-08** | Là người dùng, tôi muốn **chỉ thấy dữ liệu của mình** khi gọi bất kỳ API nào. | Mọi route `/api/v1/*` (trừ `/auth`) cần access token hợp lệ; `userId` lấy từ token do server ký, không lấy từ body/query. |
-| **US-09** | Là admin, tôi muốn vào **trang quản trị** (thống kê dùng AI), còn user thường thì không. | `/api/v1/admin/*` trả 403 nếu role ≠ ADMIN; frontend ẩn trang admin; role chỉ được đổi qua script `db:admins`. |
+| **US-09** | Là admin, tôi muốn vào **trang quản trị** (thống kê dùng AI, danh sách người dùng), còn user thường thì không. | `/api/v1/admin/*` trả 403 nếu role ≠ ADMIN; frontend ẩn trang admin; role chỉ được đổi qua script `db:admins`. |
+| **US-10** | Là admin, tôi muốn **khoá/mở khoá tài khoản** người dùng vi phạm. | Khoá thì người đó bị thu hồi mọi refresh token và không đăng nhập lại được (mật khẩu, Google, refresh, đổi mật khẩu đều bị chặn); tải lại trang là bị đẩy ra ngay; không khoá được tài khoản ADMIN (409); chỉ báo "bị khoá" khi người đăng nhập đã nhập đúng mật khẩu. |
 
 ---
 
@@ -208,11 +209,11 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 
 ### US-02 — Đăng nhập bằng mật khẩu (luồng quan trọng nhất, nên luyện kỹ)
 
-**📂 Mở [auth-page.tsx:37](../frontend/src/features/auth/auth-page.tsx#L37-L56), hàm `submit`**
+**📂 Mở [auth-page.tsx:38](../frontend/src/features/auth/auth-page.tsx#L38-L57), hàm `submit`**
 
 > Dạ, em bắt đầu từ trang đăng nhập. Khi người dùng bấm nút Đăng nhập thì hàm `submit` này chạy. Đầu tiên em kiểm tra email và mật khẩu ngay trên trình duyệt bằng Zod; sai định dạng thì báo lỗi luôn trên form, không cần gửi lên server. Đúng định dạng thì em gọi API `POST /auth/login`.
 
-**📂 Mở [http.ts:63](../frontend/src/lib/http.ts#L63-L76), hàm `request`**
+**📂 Mở [http.ts:55](../frontend/src/lib/http.ts#L55-L76), hàm `request`**
 
 > Mọi lời gọi API của frontend đều đi qua file này. Ở đây em làm hai việc: gắn thêm header `X-CashCash-Request` để chống CSRF, và bật `credentials: 'include'` để trình duyệt gửi cookie kèm theo. Riêng route đăng nhập nằm trong danh sách `NO_REFRESH` ở [dòng 30](../frontend/src/lib/http.ts#L30), tức là nếu bị lỗi 401 thì đó là sai mật khẩu thật, em không tự đi làm mới token.
 
@@ -224,11 +225,11 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 
 > Route đăng nhập có gắn rate limit: mỗi địa chỉ IP chỉ được thử 20 lần trong 15 phút, quá thì trả 429. Cái này để chống người ta thử mật khẩu liên tục. Qua rate limit thì vào controller.
 
-**📂 Mở [auth.controller.ts:45](../backend/src/features/auth/presentation/auth.controller.ts#L45-L50), hàm `login`**
+**📂 Mở [auth.controller.ts:46](../backend/src/features/auth/presentation/auth.controller.ts#L46-L51), hàm `login`**
 
 > Controller chỉ lo phần HTTP. Nó kiểm lại dữ liệu bằng đúng cái schema Zod mà frontend đã dùng, vì kiểm ở frontend thì ai cũng bỏ qua được bằng Postman. Kiểm xong thì gọi sang service để xử lý nghiệp vụ.
 
-**📂 Mở [auth.service.ts:44](../backend/src/features/auth/application/auth.service.ts#L44-L59), hàm `login`**
+**📂 Mở [auth.service.ts:45](../backend/src/features/auth/application/auth.service.ts#L45-L61), hàm `login`**
 
 > Service tìm user theo email rồi so mật khẩu. Sai email hay sai mật khẩu em đều trả cùng một lỗi là "sai thông tin đăng nhập", để người ngoài không đoán được email nào đã có tài khoản. Nếu đúng thì em làm ba việc: sinh một refresh token ngẫu nhiên, lưu nó xuống database, và ký một access token dạng JWT sống 15 phút.
 
@@ -244,7 +245,7 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 
 > Giờ em đi ngược lên. Service trả về thông tin user và hai token. Controller đặt hai token vào hai cookie có cờ HttpOnly, nghĩa là JavaScript không đọc được, rồi trả thông tin user về. Thông tin trả về không có mật khẩu, hàm `toAuthUser` đã bỏ trường đó đi.
 
-**📂 Quay lại [auth-page.tsx](../frontend/src/features/auth/auth-page.tsx#L37-L56)**
+**📂 Quay lại [auth-page.tsx](../frontend/src/features/auth/auth-page.tsx#L38-L57)**
 
 > Frontend nhận được user thì xoá cache cũ, lưu user mới vào cache rồi chuyển về trang chủ. Đó là toàn bộ luồng đăng nhập ạ.
 
@@ -252,21 +253,23 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 
 > *"Nếu mật khẩu bị đổi đúng lúc đang đăng nhập thì sao?"* — Dạ, hàm `cashcash_session_create` nhận vào mã băm mật khẩu mà service vừa kiểm, rồi khoá dòng user và so lại. Nếu đã khác thì hàm trả `false` và em trả 401, không tạo phiên.
 
-> *"Trình duyệt đang có refresh token cũ thì sao?"* — Dạ, ở [auth.controller.ts:47](../backend/src/features/auth/presentation/auth.controller.ts#L47) trước khi đặt cookie mới em huỷ token cũ của trình duyệt đó, để không còn token thừa sống trong database.
+> *"Trình duyệt đang có refresh token cũ thì sao?"* — Dạ, ở [auth.controller.ts:48](../backend/src/features/auth/presentation/auth.controller.ts#L48) trước khi đặt cookie mới em huỷ token cũ của trình duyệt đó, để không còn token thừa sống trong database.
+
+> *"Tài khoản bị admin khoá mà đăng nhập thì sao?"* — Dạ, khi `cashcash_session_create` INSERT refresh token thì trigger trong database ném lỗi mã `CCLCK`, service bắt lỗi đó ở [auth.service.ts:58](../backend/src/features/auth/application/auth.service.ts#L58) và trả 403 `ACCOUNT_LOCKED`. Em cố ý để bước này **sau** bước so mật khẩu: người nhập sai mật khẩu chỉ thấy "sai thông tin đăng nhập", nên kẻ đoán mò không biết được tài khoản nào đang bị khoá. Chi tiết ở US-10.
 
 ### US-01 — Đăng ký
 
-**📂 Mở [auth-page.tsx:41](../frontend/src/features/auth/auth-page.tsx#L41-L45)**
+**📂 Mở [auth-page.tsx:42](../frontend/src/features/auth/auth-page.tsx#L42-L46)**
 
 > Dạ, đăng ký dùng chung trang với đăng nhập. Trước khi gửi, em kiểm hai ô mật khẩu có khớp nhau không, rồi kiểm bằng schema đăng ký: tên từ 1 đến 80 ký tự, mật khẩu ít nhất 8 ký tự. Schema này nằm ở [packages/shared](../packages/shared/src/schemas/auth.schema.ts#L7-L10) nên backend cũng dùng đúng quy tắc đó. Xong thì gọi `POST /auth/register`.
 
 > Phần đi qua `http.ts`, chặn CSRF và rate limit thì giống hệt đăng nhập nên em không nói lại.
 
-**📂 Mở [auth.controller.ts:39](../backend/src/features/auth/presentation/auth.controller.ts#L39-L44), hàm `register`**
+**📂 Mở [auth.controller.ts:40](../backend/src/features/auth/presentation/auth.controller.ts#L40-L45), hàm `register`**
 
 > Controller kiểm lại bằng Zod rồi gọi service. Thành công thì trả mã 201, nghĩa là đã tạo mới một tài nguyên.
 
-**📂 Mở [auth.service.ts:28](../backend/src/features/auth/application/auth.service.ts#L28-L43), hàm `register`**
+**📂 Mở [auth.service.ts:29](../backend/src/features/auth/application/auth.service.ts#L29-L44), hàm `register`**
 
 > Service băm mật khẩu bằng scrypt, sinh id cho user và một refresh token, rồi gọi đúng một hàm trong database. Nếu email đã có người dùng, database báo lỗi trùng với mã 23505, em đổi lỗi đó thành 409 kèm câu "email đã được sử dụng".
 
@@ -284,7 +287,7 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 
 > Dạ, giả sử người dùng mở trang giao dịch, frontend gọi `GET /api/v1/transactions`.
 
-**📂 Mở [http.ts](../frontend/src/lib/http.ts#L63-L76)**
+**📂 Mở [http.ts](../frontend/src/lib/http.ts#L55-L76)**
 
 > Trình duyệt tự gửi cookie chứa access token kèm theo request. Frontend không phải làm gì, mà thực ra cũng không đọc được cookie này.
 
@@ -312,15 +315,15 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 
 > Request tiếp theo bị server trả 401. Hàm `request` bắt được lỗi này. Nếu đây không phải route đăng nhập, đăng ký và request chưa được thử lại lần nào, thì nó gọi hàm `refreshSession`.
 
-**📂 Mở [http.ts:33](../frontend/src/lib/http.ts#L33-L53), hàm `refreshSession`**
+**📂 Mở [http.ts:36](../frontend/src/lib/http.ts#L36-L53), hàm `refreshSession`**
 
 > Hàm này gọi `POST /auth/refresh`. Nếu cùng lúc có nhiều request cùng bị 401, em chỉ gọi refresh đúng một lần, các request khác chờ chung kết quả đó. Trình duyệt tự gửi cookie refresh token, cookie này chỉ được gửi tới đường dẫn `/api/v1/auth` thôi.
 
-**📂 Mở [auth.controller.ts:51](../backend/src/features/auth/presentation/auth.controller.ts#L51-L62), hàm `refresh`**
+**📂 Mở [auth.controller.ts:52](../backend/src/features/auth/presentation/auth.controller.ts#L52-L63), hàm `refresh`**
 
 > Route refresh có rate limit 120 lần trong 15 phút. Controller lấy refresh token từ cookie rồi gọi service.
 
-**📂 Mở [auth.service.ts:77](../backend/src/features/auth/application/auth.service.ts#L77-L88), hàm `refresh`**
+**📂 Mở [auth.service.ts:81](../backend/src/features/auth/application/auth.service.ts#L81-L93), hàm `refresh`**
 
 > Service kiểm token có đúng dạng 64 ký tự hex không, sinh sẵn một token mới, rồi gửi mã băm của token cũ xuống database.
 
@@ -332,21 +335,21 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 > Nếu token đã bị thay thế lâu hơn 10 giây mà vẫn có người dùng lại, nghĩa là có hai người cùng cầm một token, em coi là bị trộm và huỷ toàn bộ chuỗi token của lần đăng nhập đó.
 > Còn nếu hợp lệ thì em đọc role mới nhất của user từ bảng users, tạo token mới trong cùng chuỗi, và đánh dấu token cũ là đã bị thay.
 
-**📂 Quay lại [auth.controller.ts:51](../backend/src/features/auth/presentation/auth.controller.ts#L51-L62)**
+**📂 Quay lại [auth.controller.ts:52](../backend/src/features/auth/presentation/auth.controller.ts#L52-L63)**
 
-> Đi ngược lên. Nếu hợp lệ, controller đặt cookie mới và trả 204. Nếu là "stale", controller trả 401 với mã `REFRESH_STALE` nhưng không xoá cookie, vì tab kia đã đặt cookie mới vào trình duyệt rồi. Các trường hợp còn lại thì xoá cookie và trả 401.
+> Đi ngược lên. Nếu hợp lệ, controller đặt cookie mới và trả 204. Nếu là "stale", controller trả 401 với mã `REFRESH_STALE` nhưng không xoá cookie, vì tab kia đã đặt cookie mới vào trình duyệt rồi. Các trường hợp còn lại thì xoá cookie và trả 401. Trong đó có trường hợp tài khoản vừa bị admin khoá: INSERT token mới bị trigger chặn, service trả `locked` và controller trả 401 `ACCOUNT_LOCKED`.
 
-**📂 Quay lại [http.ts](../frontend/src/lib/http.ts#L33-L53), rồi mở [auth.tsx:24](../frontend/src/features/auth/auth.tsx#L24-L44)**
+**📂 Quay lại [http.ts](../frontend/src/lib/http.ts#L36-L53), rồi mở [auth.tsx:24](../frontend/src/features/auth/auth.tsx#L24-L44)**
 
 > Frontend nhận 204 hoặc "stale" thì gửi lại request ban đầu đúng một lần, người dùng không thấy gì cả. Nếu refresh thất bại thì `http.ts` phát sự kiện `auth-expired`. `AuthGate` ở file `auth.tsx` nghe sự kiện đó, xoá dữ liệu trong cache và đưa người dùng về trang đăng nhập.
 
 ### US-04 — Đăng xuất
 
-**📂 Mở [auth.tsx:53](../frontend/src/features/auth/auth.tsx#L53-L79), hàm `useLogout`**
+**📂 Mở [auth.tsx:53](../frontend/src/features/auth/auth.tsx#L53-L60), hàm `useLogout`**
 
 > Dạ, người dùng bấm Đăng xuất thì hook `useLogout` gọi `POST /auth/logout`.
 
-**📂 Mở [auth.controller.ts:63](../backend/src/features/auth/presentation/auth.controller.ts#L63-L67), rồi [auth.service.ts:95](../backend/src/features/auth/application/auth.service.ts#L95-L99), rồi [refresh_tokens/migration.sql:84](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L84-L94)**
+**📂 Mở [auth.controller.ts:64](../backend/src/features/auth/presentation/auth.controller.ts#L64-L68), rồi [auth.service.ts:102](../backend/src/features/auth/application/auth.service.ts#L102-L106), rồi [refresh_tokens/migration.sql:84](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L84-L94)**
 
 > Backend lấy refresh token từ cookie, gọi hàm trong database để huỷ cả chuỗi token của lần đăng nhập này, rồi xoá hai cookie và trả 204.
 
@@ -366,39 +369,41 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 
 > Khi mở app, hook `useAuth` gọi `/auth/me` để hỏi server "tôi là ai". Trong lúc chờ thì hiện chữ "Đang kiểm tra", lỗi mạng thì có nút Thử lại, còn server trả lời là chưa đăng nhập thì chuyển về trang `/login`.
 
-**📂 Mở [auth.controller.ts:99](../backend/src/features/auth/presentation/auth.controller.ts#L99-L104)**
+**📂 Mở [auth.controller.ts:100](../backend/src/features/auth/presentation/auth.controller.ts#L100-L110)**
 
 > Route này nằm trong nhóm `/auth` nên không đi qua `currentUser`; controller tự kiểm JWT, rồi đọc user từ database để lấy tên và ảnh đại diện mới nhất. Nếu access token vừa hết hạn thì lỗi 401 ở đây cũng kích hoạt cơ chế tự làm mới như bình thường.
 
+> Vì đã đọc database rồi nên em kiểm luôn cột `lockedAt`: tài khoản đang bị khoá thì xoá cookie và trả 401 `ACCOUNT_LOCKED`. Nhờ vậy người bị khoá chỉ cần tải lại trang là bị đẩy ra ngay, không phải chờ access token hết hạn.
+
 ### US-05 — Đăng nhập bằng Google
 
-**📂 Mở [auth-page.tsx:75](../frontend/src/features/auth/auth-page.tsx#L75)**
+**📂 Mở [auth-page.tsx:76](../frontend/src/features/auth/auth-page.tsx#L76)**
 
 > Dạ, nút "Đăng nhập bằng Google" không gọi API bằng fetch mà là một đường link bình thường tới `/api/v1/auth/google`, trình duyệt chuyển cả trang sang đó.
 
-**📂 Mở [auth.controller.ts:68](../backend/src/features/auth/presentation/auth.controller.ts#L68-L74), hàm `googleStart`, và [google.ts:27](../backend/src/features/auth/infrastructure/google.ts#L27-L36)**
+**📂 Mở [auth.controller.ts:69](../backend/src/features/auth/presentation/auth.controller.ts#L69-L75), hàm `googleStart`, và [google.ts:28](../backend/src/features/auth/infrastructure/google.ts#L28-L37)**
 
 > Server sinh ba chuỗi ngẫu nhiên là state, code verifier và nonce, rồi cất cả ba vào một cookie tạm, có cờ HttpOnly, sống 10 phút. Sau đó server chuyển người dùng sang trang đăng nhập của Google, gửi kèm state, nonce và mã băm của verifier, gọi là code challenge.
 
 > Người dùng chọn tài khoản trên trang của Google. Xong thì Google chuyển người dùng về địa chỉ callback của em, kèm theo một mã `code` và cái state lúc nãy.
 
-**📂 Mở [auth.controller.ts:75](../backend/src/features/auth/presentation/auth.controller.ts#L75-L98), hàm `googleCallback`**
+**📂 Mở [auth.controller.ts:76](../backend/src/features/auth/presentation/auth.controller.ts#L76-L99), hàm `googleCallback`**
 
 > Ở callback, em đọc cookie tạm rồi xoá nó ngay để nó chỉ dùng được một lần. Em so state Google gửi về với state trong cookie; không khớp thì dừng, đây là để chống CSRF. Nếu người dùng bấm huỷ trên Google thì cũng dừng.
 
-**📂 Mở [google.ts:41](../backend/src/features/auth/infrastructure/google.ts#L41-L54), hàm `exchangeGoogleCode`**
+**📂 Mở [google.ts:42](../backend/src/features/auth/infrastructure/google.ts#L42-L55), hàm `exchangeGoogleCode`**
 
 > Rồi server tự gọi sang Google, gửi code cùng verifier và client secret để đổi lấy `id_token`. Bước này là server nói chuyện trực tiếp với Google. Nếu ai đó chặn được code trên thanh địa chỉ thì cũng không đổi được, vì họ không có verifier.
 
-**📂 Mở [google.ts:63](../backend/src/features/auth/infrastructure/google.ts#L63-L79), hàm `verifyGoogleIdToken`**
+**📂 Mở [google.ts:64](../backend/src/features/auth/infrastructure/google.ts#L64-L80), hàm `verifyGoogleIdToken`**
 
 > `id_token` là một JWT do Google ký. Em kiểm chữ ký bằng public key mà Google công bố, kiểm token này đúng là cấp cho ứng dụng của em, chưa hết hạn, nonce khớp với cookie, và email đã được Google xác minh.
 
-**📂 Mở [auth.service.ts:64](../backend/src/features/auth/application/auth.service.ts#L64-L75), rồi [oauth_accounts/migration.sql](../backend/db/migrations/20261017140000_oauth_accounts/migration.sql)**
+**📂 Mở [auth.service.ts:67](../backend/src/features/auth/application/auth.service.ts#L67-L79), rồi [oauth_accounts/migration.sql](../backend/db/migrations/20261017140000_oauth_accounts/migration.sql)**
 
 > Service gọi hàm `cashcash_oauth_login` trong database. Hàm này xét ba trường hợp. Tài khoản Google này đã liên kết từ trước thì đăng nhập luôn. Chưa liên kết nhưng email trùng với một user đã có thì liên kết vào user đó. Còn chưa có gì thì tạo user mới không có mật khẩu, kèm ví và danh mục mặc định.
 
-**📂 Quay lại [googleCallback](../backend/src/features/auth/presentation/auth.controller.ts#L75-L98) và [auth-page.tsx:11](../frontend/src/features/auth/auth-page.tsx#L11-L18)**
+**📂 Quay lại [googleCallback](../backend/src/features/auth/presentation/auth.controller.ts#L76-L99) và [auth-page.tsx:11](../frontend/src/features/auth/auth-page.tsx#L11-L19)**
 
 > Thành công thì controller đặt hai cookie giống đăng nhập thường rồi chuyển về trang chủ. Lỗi ở bước nào thì chuyển về `/login` kèm mã lỗi, trang đăng nhập đọc mã đó và hiện thông báo tiếng Việt tương ứng.
 
@@ -439,7 +444,7 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 
 > Route này nằm sau `currentUser` nên bắt buộc đã đăng nhập. Rate limit ở đây tính theo user chứ không theo IP, mỗi user 10 lần. Vì kẻ đã trộm được access token có thể đổi IP liên tục để dò mật khẩu hiện tại; tính theo user thì đổi IP cũng vô ích.
 
-**📂 Mở [user.service.ts:50](../backend/src/features/users/application/user.service.ts#L50-L70)**
+**📂 Mở [user.service.ts:51](../backend/src/features/users/application/user.service.ts#L51-L72)**
 
 > Service kiểm mật khẩu hiện tại có đúng không. Riêng tài khoản tạo bằng Google mà chưa có mật khẩu thì không cần, đây là trường hợp đặt mật khẩu lần đầu.
 
@@ -465,7 +470,7 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 
 > Khi đăng nhập hoặc refresh, em đọc role từ database và đưa vào access token.
 
-**📂 Mở [admin.routes.ts:8](../backend/src/features/admin/presentation/admin.routes.ts#L8), rồi [require-role.ts:6](../backend/src/middlewares/require-role.ts#L6-L9)**
+**📂 Mở [admin.routes.ts:9](../backend/src/features/admin/presentation/admin.routes.ts#L9), rồi [require-role.ts:6](../backend/src/middlewares/require-role.ts#L6-L9)**
 
 > Toàn bộ router admin được gắn `requireRole('ADMIN')`. Middleware này so role trong token, không phải admin thì trả 403.
 
@@ -474,6 +479,54 @@ Quy tắc chung: bắt đầu từ chỗ người dùng bấm, đi xuống backe
 > Ở frontend có `AdminGate` để user thường không thấy trang admin. Nhưng đó chỉ là giao diện; ai gọi API trực tiếp bằng Postman thì vẫn bị backend chặn 403.
 
 > Nếu bị hỏi hạ quyền bao lâu có hiệu lực: Dạ, tối đa 15 phút, tới lần refresh tiếp theo, vì lúc refresh database đọc role mới nhất rồi mới ký token mới.
+
+> Ngoài thống kê dùng AI, router admin còn có `GET /users` (danh sách người dùng, tìm kiếm, lọc, phân trang) và `PATCH /users/:id/lock` (khoá/mở khoá, xem US-10). Cả hai đều nằm sau `requireRole('ADMIN')` ở dòng 9 nên không cần kiểm quyền lại.
+
+### US-10 — Admin khoá / mở khoá tài khoản
+
+> Dạ, luồng này em nói từ giao diện admin xuống database, rồi nói người bị khoá sẽ bị chặn ở những đâu.
+
+**📂 Mở [users-panel.tsx:37](../frontend/src/features/admin/users-panel.tsx#L37-L42), hàm `toggleLock`**
+
+> Trong trang quản trị có danh sách người dùng. Admin bấm "Khoá" thì frontend hỏi xác nhận trước, vì khoá là đá người đó ra khỏi mọi thiết bị; mở khoá thì không cần hỏi. Sau đó gọi `PATCH /admin/users/:id/lock` với body `{ locked: true }`. Tài khoản ADMIN không có nút khoá.
+
+**📂 Mở [admin.routes.ts:16](../backend/src/features/admin/presentation/admin.routes.ts#L16-L21)**
+
+> Route này nằm trong router admin nên đã qua `currentUser` và `requireRole('ADMIN')`. Em kiểm id trên URL phải là UUID và body phải đúng schema bằng Zod, sai thì 400.
+
+**📂 Mở [admin-users.service.ts:45](../backend/src/features/admin/application/admin-users.service.ts#L45-L50), hàm `setLock`**
+
+> Service gọi hàm `cashcash_set_user_lock` trong database. Không có user thì trả 404. Nếu người bị khoá là ADMIN thì trả 409 `CANNOT_LOCK_ADMIN`, kể cả admin tự khoá chính mình. Muốn khoá một admin thì phải hạ quyền trước bằng script, để không ai lỡ tay khoá hết admin của hệ thống.
+
+**📂 Mở [admin_users/migration.sql:27](../backend/db/migrations/20261020120000_admin_users/migration.sql#L27-L46), hàm `cashcash_set_user_lock`**
+
+> Hàm khoá dòng user bằng `FOR UPDATE`, ghi thời điểm khoá vào cột `lockedAt`, rồi thu hồi **tất cả** refresh token của người đó. Mở khoá thì đặt `lockedAt` về NULL. Người đó không được cấp lại phiên cũ, phải tự đăng nhập lại.
+
+**📂 Mở [admin_users/migration.sql:9](../backend/db/migrations/20261020120000_admin_users/migration.sql#L9-L23), trigger `refresh_tokens_guard_locked`**
+
+> Đây là chỗ em thấy hay nhất của tính năng này. Thay vì sửa từng chỗ đăng nhập, em đặt **một trigger BEFORE INSERT trên bảng `refresh_tokens`**. Mọi cách lấy phiên mới (đăng nhập mật khẩu, Google, refresh, đổi mật khẩu) đều phải INSERT một refresh token, nên chỉ cần chặn ở đây. Tài khoản đang bị khoá thì trigger ném lỗi mã `CCLCK`. Sau này có ai viết thêm một cách đăng nhập mới thì cũng tự động bị chặn.
+
+**📂 Mở [account-lock.ts](../backend/src/features/auth/application/account-lock.ts)**
+
+> Backend nhận ra lỗi `CCLCK` bằng hàm `isAccountLocked` rồi đổi thành lỗi `ACCOUNT_LOCKED` với câu tiếng Việt. Cụ thể ở từng luồng:
+
+| Luồng | Chỗ bắt | Kết quả |
+|---|---|---|
+| Đăng nhập mật khẩu | [auth.service.ts:58](../backend/src/features/auth/application/auth.service.ts#L58) | 403 `ACCOUNT_LOCKED`, **chỉ sau khi** mật khẩu đúng |
+| Đăng nhập Google | [auth.service.ts:74](../backend/src/features/auth/application/auth.service.ts#L74) | chuyển về `/login?error=account_locked` |
+| Refresh | [auth.service.ts:87](../backend/src/features/auth/application/auth.service.ts#L87), [auth.controller.ts:62](../backend/src/features/auth/presentation/auth.controller.ts#L62) | xoá cookie, 401 `ACCOUNT_LOCKED` |
+| Đổi mật khẩu | [user.service.ts:68](../backend/src/features/users/application/user.service.ts#L68) | 403 `ACCOUNT_LOCKED` |
+| Tải lại trang (`/auth/me`) | [auth.controller.ts:105](../backend/src/features/auth/presentation/auth.controller.ts#L105-L108) | xoá cookie, 401, về trang đăng nhập |
+
+> Giới hạn em biết: access token đang cầm vẫn dùng được tới khi hết hạn, tối đa 15 phút, vì `currentUser` không truy vấn database. Nhưng chỉ cần tải lại trang là `/auth/me` đẩy người đó ra, và sau 15 phút thì refresh chắc chắn thất bại.
+
+**Nếu bị hỏi thêm:**
+
+> *"Sao không kiểm `lockedAt` ngay trong `currentUser` cho chặn tức thì?"* — Dạ, vì như vậy mọi request đều phải truy vấn database, mất đúng cái lợi của JWT. Em chọn chấp nhận độ trễ tối đa 15 phút, giống như với việc hạ quyền admin. Nếu yêu cầu chặn tức thì thì em thêm danh sách user bị khoá vào Redis rồi cho `currentUser` kiểm.
+
+> *"Trigger không dùng `FOR SHARE` khoá dòng user, vậy có lọt được không?"* — Dạ, em cố ý không khoá thêm vì `cashcash_refresh_rotate` đã giữ khoá dòng token, khoá thêm dòng user có thể gây deadlock với hàm khoá tài khoản. Nếu một token lọt qua đúng khoảnh khắc đang khoá thì token đó cũng chỉ sống tới lần refresh sau, mà lần refresh sau lại đi qua trigger và bị chặn. Em có ghi lý do này ngay trong comment của migration.
+
+> *"Sao báo bị khoá sau khi kiểm mật khẩu?"* — Dạ, nếu báo trước thì ai cũng gõ email bất kỳ với mật khẩu sai là biết tài khoản đó có bị khoá không. Báo sau thì chỉ chủ tài khoản thật mới biết.
 
 
 ---
@@ -516,6 +569,8 @@ Ký bằng `JWT_SECRET` (≥ 32 ký tự, kiểm ở [env.ts:19](../backend/src/
 | `google` | `/auth/google/callback` | 20 | IP |
 | `password` | `/users/me/password` | 10 | userId |
 
+Khoá đếm là `bucket:IP`, nên 5 route của bucket `credentials` **dùng chung** 20 lần: một IP đã đăng nhập sai 15 lần thì chỉ còn 5 lần cho cả quên mật khẩu lẫn nhập OTP. Đây không phải 20 lần cho mỗi route.
+
 ### Mã lỗi
 
 | HTTP | `code` | Khi nào |
@@ -526,7 +581,11 @@ Ký bằng `JWT_SECRET` (≥ 32 ký tự, kiểm ở [env.ts:19](../backend/src/
 | 401 | `REFRESH_STALE` | tab khác vừa refresh (frontend coi như thành công) |
 | 403 | `INVALID_ORIGIN` | thiếu header `X-CashCash-Request` hoặc Origin lạ |
 | 403 | `FORBIDDEN` | không đủ role |
+| 403 | `ACCOUNT_LOCKED` | tài khoản bị khoá: đăng nhập (đúng mật khẩu), đổi mật khẩu |
+| 401 | `ACCOUNT_LOCKED` | tài khoản bị khoá: refresh, `/auth/me` (kèm xoá cookie) |
+| 404 | `NOT_FOUND` | admin khoá một user không tồn tại |
 | 409 | `CONFLICT` | email đã dùng; mật khẩu vừa bị đổi ở nơi khác |
+| 409 | `CANNOT_LOCK_ADMIN` | admin cố khoá một tài khoản ADMIN |
 | 429 | `RATE_LIMITED` | vượt rate limit |
 | 503 | `MAIL_BUSY` | hàng đợi gửi mail đầy (10 job) |
 
@@ -540,7 +599,7 @@ Mẫu trả lời khi được hỏi: **"Em chọn A vì …; cái giá là …;
 |---|---|---|---|
 | **JWT access token** thay vì session tra DB mỗi request | `currentUser` không truy vấn DB, nhanh, dễ mở rộng nhiều server | Không thu hồi được ngay (logout, đổi role, khoá user có độ trễ) | TTL ngắn 15 phút; refresh token lưu DB thu hồi được |
 | **Hai token** (access ngắn + refresh dài) thay vì một token dài | Lộ access token chỉ nguy hiểm ≤ 15 phút; người dùng vẫn giữ phiên 7 ngày | Phức tạp hơn: cần endpoint refresh, logic retry ở frontend | `http.ts` gói gọn logic, các trang không cần biết |
-| **Cookie HttpOnly** thay vì localStorage | Mã JS (kể cả XSS) không đọc được token | Cookie tự gửi kèm nên phải chống CSRF | SameSite=Lax + header `X-CashCash-Request` + kiểm Origin |
+| **Cookie HttpOnly** thay vì localStorage | Mã JS (kể cả XSS) không đọc được token | Cookie tự gửi kèm nên phải chống CSRF; XSS vẫn gửi request *thay* người dùng được, chỉ không mang token đi nơi khác được | SameSite=Lax + header `X-CashCash-Request` + kiểm Origin |
 | **Rotation + phát hiện dùng lại** | Refresh token bị trộm và dùng lại thì cả family bị thu hồi | Nhiều tab refresh cùng lúc dễ bị đăng xuất oan | Cửa sổ `stale` 10 giây + single-flight ở frontend |
 | **HS256** (khoá đối xứng) thay vì RS256 | Đơn giản, một secret, nhanh | Ai kiểm được token thì cũng ký được token | Chỉ một backend nên chấp nhận được; nhiều service thì chuyển RS256 + JWKS |
 | **scrypt** thay vì bcrypt/argon2 | Có sẵn trong `node:crypto`, không thêm thư viện native; tốn bộ nhớ nên GPU khó brute-force | Mỗi lần hash ~vài chục ms CPU | Rate limit 20 lần/15 phút |
@@ -550,6 +609,8 @@ Mẫu trả lời khi được hỏi: **"Em chọn A vì …; cái giá là …;
 | **Đăng ký báo "Email đã được sử dụng"** | UX rõ ràng | Lộ được email nào đã đăng ký (login và forgot password thì không lộ) | Rate limit; muốn chặt hơn thì xác minh email trước khi tạo tài khoản |
 | **Tự liên kết Google vào tài khoản trùng email** | Người đã đăng ký bằng mật khẩu bấm Google vẫn vào đúng tài khoản | Phụ thuộc Google đã xác minh email | Bắt buộc `email_verified === true` |
 | **Kiểm role từ JWT** thay vì tra DB | Nhanh | Hạ quyền admin có độ trễ ≤ 15 phút | Route cực nhạy cảm có thể tra DB thêm |
+| **Chặn tài khoản bị khoá bằng trigger trên `refresh_tokens`** thay vì kiểm ở từng luồng đăng nhập | Một chỗ chặn mọi đường cấp phiên, kể cả luồng viết sau này | Access token đang cầm vẫn sống ≤ 15 phút; lỗi đi qua mã SQLSTATE tự đặt (`CCLCK`) nên phải map lại ở mỗi service | Khoá thì thu hồi mọi refresh token; `/auth/me` kiểm `lockedAt` nên tải lại trang là bị đẩy ra |
+| **Không cho khoá ADMIN** | Không ai lỡ tay khoá hết admin (kể cả tự khoá mình) | Muốn khoá admin phải hạ quyền trước bằng script | Trả 409 `CANNOT_LOCK_ADMIN` kèm hướng dẫn |
 
 ---
 
@@ -579,7 +640,7 @@ Câu trả lời này dài khoảng 1 phút, có đủ lý do, bằng chứng tr
 
 Thường giảng viên sẽ mở đầu bằng *"Em làm phần nào, giới thiệu đi"*. Chuẩn bị sẵn bài này, nói theo **4 ý**: *làm gì, kiến trúc, luồng chính, điểm bảo mật*.
 
-> **(1. Làm gì)** Dạ, em phụ trách module xác thực và phân quyền. Module cho phép người dùng đăng ký, đăng nhập bằng email mật khẩu hoặc bằng Google, tự giữ phiên đăng nhập, quên mật khẩu qua OTP email, và phân quyền USER với ADMIN.
+> **(1. Làm gì)** Dạ, em phụ trách module xác thực và phân quyền. Module cho phép người dùng đăng ký, đăng nhập bằng email mật khẩu hoặc bằng Google, tự giữ phiên đăng nhập, quên mật khẩu qua OTP email, phân quyền USER với ADMIN, và cho admin khoá tài khoản vi phạm.
 >
 > **(2. Kiến trúc)** Backend em chia ba lớp. Lớp presentation gồm route, controller và cookie, chỉ lo phần HTTP. Lớp application là service chứa nghiệp vụ. Lớp infrastructure lo phần kỹ thuật như ký JWT, băm mật khẩu, gọi Google. Những thao tác cần nhiều bước trong database thì em viết thành hàm RPC trong Postgres để chạy trong một transaction.
 >
@@ -653,7 +714,7 @@ Nguyên tắc: **nói thật là có dùng AI, rồi chứng minh mình hiểu b
 | Lỗi | Khi bảng đầy, **mọi** request đều bị 429, kể cả người chưa từng sai mật khẩu |
 | Cách tấn công | Gửi request từ ~10.000 IP khác nhau (IPv6 hoặc botnet) → cả hệ thống không ai đăng nhập được trong 15 phút (DoS) |
 | Cách sửa | Bảng đầy thì **xoá khoá cũ nhất** thay vì chặn tất cả. `Map` trong JS giữ thứ tự chèn nên khoá đầu tiên là khoá cũ nhất |
-| Kiểm chứng | [rate-limit.test.ts](../backend/tests/middlewares/rate-limit.test.ts) giả lập 10.050 IP: code cũ thì test **fail**, code mới **pass**; 169 test backend pass |
+| Kiểm chứng | [rate-limit.test.ts](../backend/tests/middlewares/rate-limit.test.ts) giả lập 10.050 IP: code cũ thì test **fail**, code mới **pass**; toàn bộ test backend vẫn pass |
 | Đánh đổi | Kẻ có > 10.000 IP đẩy được bộ đếm cũ ra, nhưng người có nhiều IP như vậy vốn đã vượt được giới hạn theo IP. Muốn chặt hơn thì dùng Redis |
 
 **Cách nói (khoảng 1 phút 30):**
@@ -742,7 +803,7 @@ Mỗi câu có hai phần:
 >
 > Ở backend, hàm trong database huỷ refresh token cũ, cấp token mới, rồi server đặt lại cookie. Frontend nhận được thì gửi lại request lúc nãy đúng một lần, nên người dùng vẫn thấy dữ liệu bình thường. Còn nếu refresh cũng thất bại, ví dụ đã quá 7 ngày, thì frontend xoá dữ liệu và đưa người dùng về trang đăng nhập.
 
-📂 **Mở cho giảng viên xem:** [http.ts:82-86](../frontend/src/lib/http.ts#L82-L86), [http.ts:33-53](../frontend/src/lib/http.ts#L33-L53), [auth.controller.ts:51](../backend/src/features/auth/presentation/auth.controller.ts#L51-L62), [refresh_tokens/migration.sql:53](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L53-L81)
+📂 **Mở cho giảng viên xem:** [http.ts:82-86](../frontend/src/lib/http.ts#L82-L86), [http.ts:36-53](../frontend/src/lib/http.ts#L36-L53), [auth.controller.ts:52](../backend/src/features/auth/presentation/auth.controller.ts#L52-L63), [refresh_tokens/migration.sql:53](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L53-L81)
 
 #### Q4. Route nào cần đăng nhập, route nào không? Cấu hình ở đâu?
 
@@ -762,7 +823,7 @@ Mỗi câu có hai phần:
 >
 > Nên kể cả ai đó bỏ qua giao diện, gọi API thẳng bằng Postman thì vẫn bị chặn. Em có thể demo luôn: đăng nhập bằng user thường rồi gọi API admin sẽ thấy 403.
 
-📂 **Mở cho giảng viên xem:** [auth.tsx:47-51](../frontend/src/features/auth/auth.tsx#L47-L51), [admin.routes.ts:8](../backend/src/features/admin/presentation/admin.routes.ts#L8), [require-role.ts:6-9](../backend/src/middlewares/require-role.ts#L6-L9)
+📂 **Mở cho giảng viên xem:** [auth.tsx:47-51](../frontend/src/features/auth/auth.tsx#L47-L51), [admin.routes.ts:9](../backend/src/features/admin/presentation/admin.routes.ts#L9), [require-role.ts:6-9](../backend/src/middlewares/require-role.ts#L6-L9)
 
 #### Q6. Mật khẩu được lưu thế nào? Chỉ cho tôi.
 
@@ -832,7 +893,7 @@ Mỗi câu có hai phần:
 
 > Dạ, để nếu database bị lộ thì token cũng không dùng được. Database chỉ chứa mã băm của token. Khi người dùng gửi token lên, server tự băm rồi mới so. Kẻ xấu có mã băm thì cũng không gửi lên thay token được. Đây cũng là nguyên tắc giống như không lưu mật khẩu thật.
 
-📂 **Mở cho giảng viên xem:** [refresh-token.ts:7-11](../backend/src/features/auth/infrastructure/refresh-token.ts#L7-L11), [auth.service.ts:81](../backend/src/features/auth/application/auth.service.ts#L81)
+📂 **Mở cho giảng viên xem:** [refresh-token.ts:7-11](../backend/src/features/auth/infrastructure/refresh-token.ts#L7-L11), [auth.service.ts:85](../backend/src/features/auth/application/auth.service.ts#L85)
 
 #### Q13. Vì sao sai email và sai mật khẩu báo cùng một lỗi?
 
@@ -844,7 +905,7 @@ Mỗi câu có hai phần:
 >
 > Có một chỗ em chấp nhận lộ là trang đăng ký báo "email đã được sử dụng", vì nếu không báo thì người dùng không hiểu vì sao đăng ký không được. Đó là đánh đổi em đã ghi lại.
 
-📂 **Mở cho giảng viên xem:** [auth.service.ts:49-50](../backend/src/features/auth/application/auth.service.ts#L49-L50), [password.ts:16](../backend/src/features/auth/infrastructure/password.ts#L16)
+📂 **Mở cho giảng viên xem:** [auth.service.ts:50-51](../backend/src/features/auth/application/auth.service.ts#L50-L51), [password.ts:16](../backend/src/features/auth/infrastructure/password.ts#L16)
 
 #### Q14. Header `X-CashCash-Request: 1` để làm gì?
 
@@ -882,7 +943,7 @@ Mỗi câu có hai phần:
 >
 > Nhưng kiểm ở frontend chỉ để người dùng thấy lỗi nhanh, ai cũng bỏ qua được bằng Postman, nên backend luôn kiểm lại.
 
-📂 **Mở cho giảng viên xem:** [auth.schema.ts](../packages/shared/src/schemas/auth.schema.ts), [auth-page.tsx:41](../frontend/src/features/auth/auth-page.tsx#L41), [validation.ts:5](../backend/src/lib/validation.ts#L5)
+📂 **Mở cho giảng viên xem:** [auth.schema.ts](../packages/shared/src/schemas/auth.schema.ts), [auth-page.tsx:42](../frontend/src/features/auth/auth-page.tsx#L42), [validation.ts:5](../backend/src/lib/validation.ts#L5)
 
 ### 7.3 Câu hỏi "nếu … thì sao"
 
@@ -906,7 +967,7 @@ Mỗi câu có hai phần:
 >
 > Nếu không có cơ chế này thì người dùng mở nhiều tab sẽ bị đăng xuất oan. Đây cũng là một lỗi mà code AI viết ban đầu bị sai và em đã sửa.
 
-📂 **Mở cho giảng viên xem:** [http.ts:33-53](../frontend/src/lib/http.ts#L33-L53), [refresh_tokens/migration.sql:63-65](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L63-L65), [auth.controller.ts:58-59](../backend/src/features/auth/presentation/auth.controller.ts#L58-L59)
+📂 **Mở cho giảng viên xem:** [http.ts:36-53](../frontend/src/lib/http.ts#L36-L53), [refresh_tokens/migration.sql:63-65](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L63-L65), [auth.controller.ts:59-60](../backend/src/features/auth/presentation/auth.controller.ts#L59-L60)
 
 #### Q20. Admin bị hạ xuống USER, bao lâu thì mất quyền?
 
@@ -916,7 +977,7 @@ Mỗi câu có hai phần:
 >
 > Đây là đánh đổi của việc kiểm role từ token cho nhanh. Nếu cần mất quyền ngay lập tức thì với những route cực kỳ nhạy cảm em có thể tra role trong database ở mỗi request.
 
-📂 **Mở cho giảng viên xem:** [refresh_tokens/migration.sql:73](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L73), [auth.service.ts:87](../backend/src/features/auth/application/auth.service.ts#L87)
+📂 **Mở cho giảng viên xem:** [refresh_tokens/migration.sql:73](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L73), [auth.service.ts:92](../backend/src/features/auth/application/auth.service.ts#L92)
 
 #### Q21. Người dùng gửi thêm `"role": "ADMIN"` khi đăng ký thì sao?
 
@@ -954,7 +1015,7 @@ Mỗi câu có hai phần:
 >
 > Em làm vậy vì người ta đổi mật khẩu thường là do nghi bị lộ, nên phải đá các phiên khác ra.
 
-📂 **Mở cho giảng viên xem:** [user.controller.ts:12-17](../backend/src/features/users/presentation/user.controller.ts#L12-L17), [user.service.ts:50-70](../backend/src/features/users/application/user.service.ts#L50-L70), [refresh_tokens/migration.sql:98-114](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L98-L114)
+📂 **Mở cho giảng viên xem:** [user.controller.ts:12-17](../backend/src/features/users/presentation/user.controller.ts#L12-L17), [user.service.ts:51-72](../backend/src/features/users/application/user.service.ts#L51-L72), [refresh_tokens/migration.sql:98-114](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L98-L114)
 
 #### Q25. Đăng nhập Google bằng email trùng với tài khoản đã đăng ký bằng mật khẩu?
 
@@ -964,7 +1025,7 @@ Mỗi câu có hai phần:
 >
 > Làm vậy an toàn được là nhờ em bắt buộc email phải được Google xác minh. Nếu không, kẻ xấu tạo một tài khoản Google ghi email của nạn nhân là chiếm được tài khoản.
 
-📂 **Mở cho giảng viên xem:** [oauth_accounts/migration.sql:36-48](../backend/db/migrations/20261017140000_oauth_accounts/migration.sql#L36-L48), [google.ts:75](../backend/src/features/auth/infrastructure/google.ts#L75)
+📂 **Mở cho giảng viên xem:** [oauth_accounts/migration.sql:36-48](../backend/db/migrations/20261017140000_oauth_accounts/migration.sql#L36-L48), [google.ts:76](../backend/src/features/auth/infrastructure/google.ts#L76)
 
 #### Q26. Tài khoản tạo bằng Google muốn đăng nhập bằng mật khẩu?
 
@@ -974,7 +1035,7 @@ Mỗi câu có hai phần:
 >
 > Có một điểm em cố ý làm: luồng quên mật khẩu bỏ qua tài khoản chưa có mật khẩu, để không ai dùng đường quên mật khẩu chiếm tài khoản Google của người khác.
 
-📂 **Mở cho giảng viên xem:** [user.service.ts:54-60](../backend/src/features/users/application/user.service.ts#L54-L60), [password-reset.service.ts:24](../backend/src/features/auth/application/password-reset.service.ts#L24)
+📂 **Mở cho giảng viên xem:** [user.service.ts:55-61](../backend/src/features/users/application/user.service.ts#L55-L61), [password-reset.service.ts:24](../backend/src/features/auth/application/password-reset.service.ts#L24)
 
 #### Q27. Đoán thử mã OTP 6 số được không?
 
@@ -1010,7 +1071,7 @@ Mỗi câu có hai phần:
 >
 > CashCash chỉ cần biết người dùng là ai, nên em chỉ dùng `id_token`, không giữ token gọi API của Google.
 
-📂 **Mở cho giảng viên xem:** [google.ts:32](../backend/src/features/auth/infrastructure/google.ts#L32) (xin quyền `openid email profile`), [google.ts:40-54](../backend/src/features/auth/infrastructure/google.ts#L40-L54)
+📂 **Mở cho giảng viên xem:** [google.ts:33](../backend/src/features/auth/infrastructure/google.ts#L33) (xin quyền `openid email profile`), [google.ts:41-55](../backend/src/features/auth/infrastructure/google.ts#L41-L55)
 
 #### Q31. Không có khoá bí mật của Google, sao em kiểm được chữ ký `id_token`?
 
@@ -1020,7 +1081,7 @@ Mỗi câu có hai phần:
 >
 > Còn token của CashCash thì khác, em dùng HS256, chỉ có một khoá bí mật vừa để ký vừa để kiểm.
 
-📂 **Mở cho giảng viên xem:** [google.ts:10](../backend/src/features/auth/infrastructure/google.ts#L10), [google.ts:66-69](../backend/src/features/auth/infrastructure/google.ts#L66-L69)
+📂 **Mở cho giảng viên xem:** [google.ts:10](../backend/src/features/auth/infrastructure/google.ts#L10), [google.ts:67-70](../backend/src/features/auth/infrastructure/google.ts#L67-L70)
 
 #### Q32. Hạn chế lớn nhất của module này là gì, em sẽ cải thiện thế nào?
 
@@ -1038,6 +1099,52 @@ Mỗi câu có hai phần:
 
 📂 **Mở cho giảng viên xem:** [rate-limit.ts](../backend/src/middlewares/rate-limit.ts), [rate-limit.test.ts](../backend/tests/middlewares/rate-limit.test.ts), [AI_USAGE.md](../AI_USAGE.md) case #3
 
+### 7.5 Câu hỏi vặn (giảng viên muốn thử hiểu sâu tới đâu)
+
+#### Q34. Admin khoá một tài khoản thì người đó bị chặn ở đâu, bao lâu có hiệu lực?
+
+🗣 **Trả lời:**
+
+> Dạ, bị chặn ở mọi chỗ cấp phiên mới, và có hiệu lực chậm nhất sau 15 phút. Khi khoá, database ghi `lockedAt` và thu hồi tất cả refresh token của người đó. Trên bảng `refresh_tokens` có một trigger: tài khoản đang bị khoá thì không INSERT được token mới. Vì đăng nhập, Google, refresh hay đổi mật khẩu đều phải INSERT token nên đều bị chặn ở cùng một chỗ.
+>
+> Access token đang cầm thì vẫn dùng được tới khi hết hạn, vì `currentUser` không truy vấn database. Nhưng chỉ cần tải lại trang là `/auth/me` thấy `lockedAt` và đẩy người đó ra ngay.
+
+📂 **Mở cho giảng viên xem:** [admin_users/migration.sql:9-46](../backend/db/migrations/20261020120000_admin_users/migration.sql#L9-L46), [account-lock.ts](../backend/src/features/auth/application/account-lock.ts), [auth.controller.ts:105-108](../backend/src/features/auth/presentation/auth.controller.ts#L105-L108)
+
+#### Q35. Cookie HttpOnly rồi thì XSS hết nguy hiểm à?
+
+🗣 **Trả lời:**
+
+> Dạ không. HttpOnly chỉ ngăn mã độc **đọc** token để mang đi nơi khác dùng. Nhưng mã độc chạy ngay trong trang CashCash thì vẫn gọi `fetch` được, trình duyệt vẫn tự gắn cookie, và nó cũng tự thêm được header `X-CashCash-Request` vì nó cùng origin. Nghĩa là trong lúc trang đang mở, XSS vẫn làm được mọi việc thay người dùng.
+>
+> Cái lợi của HttpOnly là thiệt hại dừng lại khi người dùng đóng trang, kẻ tấn công không giữ được token 7 ngày. Còn chống XSS thì phải làm ở chỗ khác: React tự escape dữ liệu khi hiển thị, và `helmet` gắn Content-Security-Policy.
+
+📂 **Mở cho giảng viên xem:** [auth.cookie.ts:9](../backend/src/features/auth/presentation/auth.cookie.ts#L9), [app.ts:17](../backend/src/app.ts#L17)
+
+#### Q36. Kẻ trộm refresh token có lợi dụng cửa sổ `stale` 10 giây để né bị phát hiện được không?
+
+🗣 **Trả lời:**
+
+> Dạ, né bị phát hiện thì được, nhưng không lấy được gì. Trạng thái `stale` chỉ trả 401 và **không cấp token mới**. Kẻ trộm gửi token cũ trong 10 giây đó thì không bị huỷ family, nhưng cũng không có phiên nào. Gửi sau 10 giây thì bị coi là dùng lại và cả family bị huỷ.
+
+📂 **Mở cho giảng viên xem:** [refresh_tokens/migration.sql:62-69](../backend/db/migrations/20261017130000_refresh_tokens/migration.sql#L62-L69)
+
+#### Q37. SameSite=Lax đã chặn CSRF rồi, sao còn cần header và kiểm Origin?
+
+🗣 **Trả lời:**
+
+> Dạ, vì SameSite tính theo **site** chứ không theo origin. Site là tên miền gốc, ví dụ mọi subdomain của `example.com` đều cùng một site. Nếu một subdomain khác bị chiếm thì request từ đó vẫn mang cookie. Ngoài ra Lax vẫn gửi cookie khi người dùng bấm link điều hướng bằng GET. Nên em thêm hai lớp nữa: header tuỳ chỉnh thì trang khác phải qua CORS preflight mới gắn được, và Origin phải nằm trong danh sách cho phép. Lớp này hỏng thì còn lớp kia.
+
+📂 **Mở cho giảng viên xem:** [auth.cookie.ts:9](../backend/src/features/auth/presentation/auth.cookie.ts#L9), [app.ts:26-34](../backend/src/app.ts#L26-L34)
+
+#### Q38. Giới hạn 20 lần là cho mỗi route à? Ở sau NAT (cả phòng lab chung một IP) thì sao?
+
+🗣 **Trả lời:**
+
+> Dạ không, 20 lần là tổng cho cả năm route đăng nhập, đăng ký, quên mật khẩu, nhập OTP và đặt lại mật khẩu, tính theo IP, vì khoá đếm là tên bucket cộng IP. Nếu cả phòng lab dùng chung một IP thì đúng là mọi người dùng chung 20 lần, có thể bị 429 oan. Đó là nhược điểm của đếm theo IP. Cách khắc phục là đếm thêm theo email, hoặc dùng captcha khi vượt ngưỡng thay vì chặn hẳn.
+
+📂 **Mở cho giảng viên xem:** [rate-limit.ts:12](../backend/src/middlewares/rate-limit.ts#L12), [auth.routes.ts:6](../backend/src/features/auth/presentation/auth.routes.ts#L6)
+
 
 ---
 
@@ -1048,7 +1155,7 @@ Mỗi câu có hai phần:
 ```bash
 npx vitest run backend/tests/features/auth backend/tests/middlewares backend/tests/features/users backend/tests/features/admin frontend/tests/features/auth frontend/tests/features/admin
 ```
-Kết quả lần chạy gần nhất (2026-10-20): **14 file, 72 test, tất cả pass**. Toàn bộ backend: 19 file, 169 test pass.
+Kết quả lần chạy gần nhất (2026-10-22): **17 file, 89 test, tất cả pass**. Toàn bộ backend: 21 file, 183 test pass.
 
 | File test | Kiểm gì |
 |---|---|
@@ -1061,7 +1168,10 @@ Kết quả lần chạy gần nhất (2026-10-20): **14 file, 72 test, tất c�
 | [rate-limit.test.ts](../backend/tests/middlewares/rate-limit.test.ts) | Chặn một IP sau `max` lần mà IP khác vẫn qua; 10.050 IP lạ không khoá được người dùng bình thường (lỗi đã sửa, xem 6.6) |
 | [user.password.test.ts](../backend/tests/features/users/application/user.password.test.ts) | Đổi/đặt mật khẩu |
 | [admin.routes.test.ts](../backend/tests/features/admin/application/admin.routes.test.ts) | 403 với USER |
+| [auth.lock.test.ts](../backend/tests/features/auth/application/auth.lock.test.ts) | Tài khoản bị khoá: chỉ báo bị khoá khi mật khẩu đúng; refresh bị từ chối và xoá cookie; `/auth/me` đẩy ra dù access token còn hạn; đổi mật khẩu bị chặn |
+| [admin-users.test.ts](../backend/tests/features/admin/application/admin-users.test.ts) | Chỉ admin gọi được; phân trang/tìm kiếm; khoá và mở khoá; không khoá được ADMIN (kể cả chính mình); 404/400 khi id hoặc body sai |
 | [auth.test.tsx](../frontend/tests/features/auth/auth.test.tsx), [admin-gate.test.tsx](../frontend/tests/features/admin/admin-gate.test.tsx), [password-recovery-page.test.tsx](../frontend/tests/features/auth/password-recovery-page.test.tsx) | Chuyển hướng khi chưa đăng nhập, đăng nhập/đăng ký, xoá cache khi đăng xuất, lỗi Google, chặn trang admin, trang quên mật khẩu |
+| [users-panel.test.tsx](../frontend/tests/features/admin/users-panel.test.tsx) | Danh sách user, không có nút khoá cho ADMIN, hỏi xác nhận trước khi khoá, mở khoá không hỏi, tìm kiếm/lọc |
 
 Script kiểm với DB thật: [check-auth.ts](../backend/scripts/check-auth.ts), [check-password-reset.ts](../backend/scripts/check-password-reset.ts).
 
@@ -1074,6 +1184,7 @@ Script kiểm với DB thật: [check-auth.ts](../backend/scripts/check-auth.ts)
 5. **Phân quyền**: đăng nhập user thường, gõ `/admin` → bị chuyển về trang chủ; gọi `fetch('/api/v1/admin/ping').then(r => r.status)` → **403**.
 6. **Đăng xuất**: cookie biến mất; trong Supabase, bảng `refresh_tokens` có `revokedAt` cho cả family.
 7. **Quên mật khẩu**: `npm run mail:up` mở Mailpit, gửi OTP, nhập sai vài lần, rồi nhập đúng.
+8. **Khoá tài khoản**: mở hai trình duyệt (hoặc một cửa sổ ẩn danh). Trình duyệt A đăng nhập user thường, trình duyệt B đăng nhập admin, vào `/admin` rồi bấm "Khoá" user A. Ở A bấm F5: bị đẩy về `/login` (Network: `/auth/me` trả 401 `ACCOUNT_LOCKED`; trang login không hiện lý do vì `useAuth` coi mọi 401 là chưa đăng nhập). Đăng nhập lại A với mật khẩu **sai** thì báo "Email hoặc mật khẩu không đúng"; mật khẩu **đúng** thì báo bị khoá. Mở khoá ở B rồi A đăng nhập lại bình thường.
 
 ### Trước buổi chấm
 
@@ -1109,4 +1220,7 @@ Script kiểm với DB thật: [check-auth.ts](../backend/scripts/check-auth.ts)
 | timingSafeEqual | So sánh mất thời gian như nhau dù sai ở ký tự nào, chống đo thời gian |
 | RPC | Hàm Postgres gọi từ backend, chạy trong một transaction |
 | `FOR UPDATE` | Khoá dòng, request khác phải chờ, chống race condition |
+| Trigger | Hàm Postgres tự chạy trước/sau khi INSERT/UPDATE một dòng; dùng để ép role về USER và chặn cấp phiên cho tài khoản bị khoá |
+| SQLSTATE | Mã lỗi 5 ký tự của Postgres (vd. `23505` trùng khoá); `CCLCK` là mã tự đặt cho "tài khoản bị khoá" |
+| `lockedAt` | Cột trên `users`; khác NULL nghĩa là tài khoản đang bị admin khoá |
 | Rate limit | Giới hạn số request trong một khoảng thời gian |
